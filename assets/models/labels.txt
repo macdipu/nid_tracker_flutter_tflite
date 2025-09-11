@@ -1,0 +1,10 @@
+dob
+father_name
+image
+mother_name
+name
+name_bn
+nid_front_image
+nid_no
+signature
+
