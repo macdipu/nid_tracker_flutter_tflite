@@ -10,15 +10,15 @@ class Bbox extends StatelessWidget {
   final Color color;
 
   const Bbox(
-    this.x,
-    this.y,
-    this.width,
-    this.height,
-    this.label,
-    this.score,
-    this.color, {
-    super.key,
-  });
+      this.x,
+      this.y,
+      this.width,
+      this.height,
+      this.label,
+      this.score,
+      this.color, {
+        super.key,
+      });
 
   @override
   Widget build(BuildContext context) {
@@ -32,24 +32,21 @@ class Bbox extends StatelessWidget {
           border: Border.all(color: color, width: 3),
           borderRadius: const BorderRadius.all(Radius.circular(4)),
         ),
-        child: label.isEmpty
-            ? const SizedBox.shrink()
-            : Align(
-                alignment: Alignment.topLeft,
-                child: FittedBox(
-                  child: Container(
-                    color: color,
-                    padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 1),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: <Widget>[
-                        Text(label, style: const TextStyle(color: Colors.white)),
-                        Text(' ${(score * 100).toStringAsFixed(0)}%', style: const TextStyle(color: Colors.white)),
-                      ],
-                    ),
-                  ),
-                ),
+        child: Align(
+          alignment: Alignment.topLeft,
+          child: FittedBox(
+            child: Container(
+              color: color,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: <Widget>[
+                  Text(label),
+                  Text(' ${(score * 100).toStringAsFixed(0)}%'),
+                ],
               ),
+            ),
+          ),
+        ),
       ),
     );
   }

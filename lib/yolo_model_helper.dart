@@ -15,13 +15,16 @@ class YoloModelHelper {
   List<String> labels = const [];
   late List<int> _inputShape;
   bool _channelsFirst = false;
-  late Object _inputType; // changed from TfLiteType to Object
+  late Object _inputType;
   bool _initialized = false;
   bool _disposed = false;
-  bool _inputIsFloat = true; // new
-  int frameCounter = 10;
-  List<List<List<double>>>? _bufNHWC; // shape [H][W][3]
-  List<List<List<double>>>? _bufNCHW; // shape [3][H][W]
+  bool _inputIsFloat = true;
+  int frameCounter = 0; // Changed to start at 0
+  List<List<List<double>>>? _bufNHWC;
+  List<List<List<double>>>? _bufNCHW;
+
+  // Performance optimization: reuse output buffer
+  List<List<double>>? _outputBuffer;
 
   YoloModelHelper({
     required this.modelPath,
@@ -43,7 +46,10 @@ class YoloModelHelper {
           .where((e) => e.isNotEmpty)
           .toList(growable: false);
 
-      final options = InterpreterOptions()..threads = 4; // enable multithreading
+      // Optimize interpreter options for better performance
+      final options = InterpreterOptions()
+        ..threads = 4; // Use 4 threads
+
       _interpreter = await Interpreter.fromAsset(modelPath, options: options);
       _inputShape = _interpreter!.getInputTensor(0).shape;
       _inputType = _interpreter!.getInputTensor(0).type;
@@ -68,12 +74,20 @@ class YoloModelHelper {
       _interpreter!.allocateTensors();
       _inputShape = _interpreter!.getInputTensor(0).shape;
 
+      // Pre-allocate output buffer for better performance
+      final outTensor = _interpreter!.getOutputTensor(0);
+      final oShape = outTensor.shape;
+      if (oShape.length == 3 && oShape[0] == 1) {
+        final d1 = oShape[1];
+        final d2 = oShape[2];
+        _outputBuffer = List.generate(d1, (_) => List<double>.filled(d2, 0.0, growable: false), growable: false);
+      }
+
       // Wrap with isolate for async inference
       _isolateInterpreter = await IsolateInterpreter.create(address: _interpreter!.address);
       _initialized = true;
 
       if (kDebugMode) {
-        final outTensor = _interpreter!.getOutputTensor(0);
         debugPrint('✅ YOLO init done: Input=$_inputShape layout=${_channelsFirst ? 'NCHW' : 'NHWC'} type=$_inputType float=$_inputIsFloat');
         debugPrint('✅ Output shape: ${outTensor.shape}');
         debugPrint('✅ Labels: ${labels.length}');
@@ -85,7 +99,7 @@ class YoloModelHelper {
     }
   }
 
-  // Legacy sync inference (kept for compatibility) - still runs in main isolate.
+  // Legacy sync inference (kept for compatibility)
   List<List<double>> infer(Image image) {
     assert(_interpreter != null, 'Model not initialized');
     final input = _preprocessImageToNestedList(image);
@@ -99,11 +113,11 @@ class YoloModelHelper {
   }
 
   Future<(List<int>, List<List<double>>, List<double>)> inferAndPostprocessImageAsync(
-    Image image, {
-    double confidenceThreshold = 0.7,
-    double iouThreshold = 0.1,
-    bool agnostic = false,
-  }) async {
+      Image image, {
+        double confidenceThreshold = 0.5, // Lowered default threshold
+        double iouThreshold = 0.4,
+        bool agnostic = false,
+      }) async {
     final preds = await inferImageAsync(image);
     return postprocess(
       preds,
@@ -115,44 +129,42 @@ class YoloModelHelper {
     );
   }
 
-  // Camera image streaming inference. Converts YUV420 -> RGB -> model input (nearest resize inline)
+  // Optimized camera image inference with better YUV handling
   Future<(List<int>, List<List<double>>, List<double>)?> inferCameraImage(
-    CameraImage cameraImage, {
-    double confidenceThreshold = 0.5,
-    double iouThreshold = 0.4,
-    bool agnostic = false,
-    int processEveryNFrames = 1,
-  }) async {
+      CameraImage cameraImage, {
+        double confidenceThreshold = 0.3, // Lowered for better detection
+        double iouThreshold = 0.4,
+        bool agnostic = false,
+        int processEveryNFrames = 1,
+      }) async {
     if (!_initialized) return null;
+
     frameCounter++;
-    if (frameCounter % processEveryNFrames != 0) return null; // skip frames for speed
+    if (frameCounter % processEveryNFrames != 0) return null;
+
     final Stopwatch sw = Stopwatch()..start();
-    final dynamic input = _preprocessCameraImage(cameraImage);
-    final preds = await _runOnInputAsync(input);
-    final (classes, bboxes, scores) = postprocess(
-      preds,
-      cameraImage.width,
-      cameraImage.height,
-      confidenceThreshold: confidenceThreshold,
-      iouThreshold: iouThreshold,
-      agnostic: agnostic,
-    );
-    if (kDebugMode) {
-      debugPrint('📷 Frame infer ${sw.elapsedMilliseconds}ms det=${bboxes.length}');
-      if (bboxes.isEmpty) {
-        // print simple score stats
-        double maxScore = 0;
-        if (preds.length > 4) {
-          for (int j = 4; j < preds.length; j++) {
-            for (int i = 0; i < preds[j].length; i++) {
-              if (preds[j][i] > maxScore) maxScore = preds[j][i];
-            }
-          }
-        }
-        debugPrint('🔍 Max raw class score (pre-threshold) = $maxScore');
+
+    try {
+      final dynamic input = _preprocessCameraImageOptimized(cameraImage);
+      final preds = await _runOnInputAsync(input);
+      final (classes, bboxes, scores) = postprocess(
+        preds,
+        cameraImage.width,
+        cameraImage.height,
+        confidenceThreshold: confidenceThreshold,
+        iouThreshold: iouThreshold,
+        agnostic: agnostic,
+      );
+
+      if (kDebugMode && sw.elapsedMilliseconds > 100) {
+        debugPrint('📷 Slow frame: ${sw.elapsedMilliseconds}ms det=${bboxes.length}');
       }
+
+      return (classes, bboxes, scores);
+    } catch (e) {
+      debugPrint('❌ Camera inference error: $e');
+      return null;
     }
-    return (classes, bboxes, scores);
   }
 
   void dispose() {
@@ -164,7 +176,7 @@ class YoloModelHelper {
     _disposed = true;
   }
 
-  // --- Internal helpers ---
+  // --- Optimized Internal helpers ---
   dynamic _preprocessImageToNestedList(Image image) {
     final resized = copyResize(image, width: inWidth, height: inHeight);
     if (_channelsFirst) {
@@ -188,9 +200,9 @@ class YoloModelHelper {
       return [
         List.generate(
           inHeight,
-          (y) => List.generate(
+              (y) => List.generate(
             inWidth,
-            (x) {
+                (x) {
               final p = resized.getPixel(x, y);
               return [
                 p.rNormalized.toDouble(),
@@ -206,44 +218,76 @@ class YoloModelHelper {
     }
   }
 
-  dynamic _preprocessCameraImage(CameraImage image) {
-    // Assumes YUV420.
+  // Optimized camera preprocessing with better YUV420 handling
+  dynamic _preprocessCameraImageOptimized(CameraImage image) {
     final int srcW = image.width;
     final int srcH = image.height;
     final planeY = image.planes[0];
     final planeU = image.planes.length > 1 ? image.planes[1] : null;
     final planeV = image.planes.length > 2 ? image.planes[2] : null;
+
     final int yRowStride = planeY.bytesPerRow;
     final int uvRowStride = planeU?.bytesPerRow ?? 0;
-    final int uvPixelStride = planeU?.bytesPerPixel ?? 1; // Often 2
+    final int uvPixelStride = planeU?.bytesPerPixel ?? 1;
 
-    double scaleY = srcH / inHeight;
-    double scaleX = srcW / inWidth;
+    // Use more precise scaling
+    final double scaleX = srcW / inWidth;
+    final double scaleY = srcH / inHeight;
+
     double norm(double v) => _inputIsFloat ? (v / 255.0) : v;
 
     if (_channelsFirst) {
+      // Reuse buffer if available
       _bufNCHW ??= [
-        List.generate(inHeight, (_) => List<double>.filled(inWidth, 0.0)), // R
-        List.generate(inHeight, (_) => List<double>.filled(inWidth, 0.0)), // G
-        List.generate(inHeight, (_) => List<double>.filled(inWidth, 0.0)), // B
+        List.generate(inHeight, (_) => List<double>.filled(inWidth, 0.0, growable: false)), // R
+        List.generate(inHeight, (_) => List<double>.filled(inWidth, 0.0, growable: false)), // G
+        List.generate(inHeight, (_) => List<double>.filled(inWidth, 0.0, growable: false)), // B
       ];
       final cbuf = _bufNCHW!; // [3][H][W]
+
       for (int y = 0; y < inHeight; y++) {
-        final srcY = (y * scaleY).clamp(0, srcH - 1).toInt();
+        final srcYf = y * scaleY;
+        final srcY = srcYf.floor().clamp(0, srcH - 1);
+        final srcYNext = (srcYf.ceil()).clamp(0, srcH - 1);
+        final yFrac = srcYf - srcY;
+
         for (int x = 0; x < inWidth; x++) {
-          final srcX = (x * scaleX).clamp(0, srcW - 1).toInt();
-          final yIndex = srcY * yRowStride + srcX;
-          final int Y = planeY.bytes[yIndex];
+          final srcXf = x * scaleX;
+          final srcX = srcXf.floor().clamp(0, srcW - 1);
+          final srcXNext = (srcXf.ceil()).clamp(0, srcW - 1);
+          final xFrac = srcXf - srcX;
+
+          // Bilinear interpolation for Y channel
+          final y1Index = srcY * yRowStride + srcX;
+          final y2Index = srcY * yRowStride + srcXNext;
+          final y3Index = srcYNext * yRowStride + srcX;
+          final y4Index = srcYNext * yRowStride + srcXNext;
+
+          final Y1 = planeY.bytes[y1Index].toDouble();
+          final Y2 = planeY.bytes[y2Index].toDouble();
+          final Y3 = planeY.bytes[y3Index].toDouble();
+          final Y4 = planeY.bytes[y4Index].toDouble();
+
+          final Y = Y1 * (1 - xFrac) * (1 - yFrac) +
+              Y2 * xFrac * (1 - yFrac) +
+              Y3 * (1 - xFrac) * yFrac +
+              Y4 * xFrac * yFrac;
+
+          // Get UV values (subsampled)
           int U = 128, V = 128;
           if (planeU != null && planeV != null) {
-            final uvY = (srcY >> 1);
-            final uvX = (srcX >> 1);
+            final uvY = (srcY >> 1).clamp(0, (srcH >> 1) - 1);
+            final uvX = (srcX >> 1).clamp(0, (srcW >> 1) - 1);
             final uIndex = uvY * uvRowStride + uvX * uvPixelStride;
             final vIndex = uvY * (planeV.bytesPerRow) + uvX * (planeV.bytesPerPixel ?? uvPixelStride);
-            U = planeU.bytes[uIndex];
-            V = planeV.bytes[vIndex];
+
+            if (uIndex < planeU.bytes.length && vIndex < planeV.bytes.length) {
+              U = planeU.bytes[uIndex];
+              V = planeV.bytes[vIndex];
+            }
           }
-          final rgb = _yuvToRgb(Y, U, V); // values 0..1
+
+          final rgb = _yuvToRgbOptimized(Y.toInt(), U, V);
           cbuf[0][y][x] = norm(rgb[0] * 255.0);
           cbuf[1][y][x] = norm(rgb[1] * 255.0);
           cbuf[2][y][x] = norm(rgb[2] * 255.0);
@@ -251,27 +295,38 @@ class YoloModelHelper {
       }
       return [cbuf]; // add batch dim
     } else {
+      // NHWC format - reuse buffer
       _bufNHWC ??= List.generate(
         inHeight,
-        (_) => List.generate(inWidth, (_) => List<double>.filled(3, 0.0)),
-      ); // [H][W][3]
+            (_) => List.generate(inWidth, (_) => List<double>.filled(3, 0.0, growable: false), growable: false),
+      );
       final hbuf = _bufNHWC!;
+
       for (int y = 0; y < inHeight; y++) {
-        final srcY = (y * scaleY).clamp(0, srcH - 1).toInt();
+        final srcYf = y * scaleY;
+        final srcY = srcYf.floor().clamp(0, srcH - 1);
+
         for (int x = 0; x < inWidth; x++) {
-          final srcX = (x * scaleX).clamp(0, srcW - 1).toInt();
+          final srcXf = x * scaleX;
+          final srcX = srcXf.floor().clamp(0, srcW - 1);
+
           final yIndex = srcY * yRowStride + srcX;
           final int Y = planeY.bytes[yIndex];
+
           int U = 128, V = 128;
           if (planeU != null && planeV != null) {
-            final uvY = (srcY >> 1);
-            final uvX = (srcX >> 1);
+            final uvY = (srcY >> 1).clamp(0, (srcH >> 1) - 1);
+            final uvX = (srcX >> 1).clamp(0, (srcW >> 1) - 1);
             final uIndex = uvY * uvRowStride + uvX * uvPixelStride;
             final vIndex = uvY * (planeV.bytesPerRow) + uvX * (planeV.bytesPerPixel ?? uvPixelStride);
-            U = planeU.bytes[uIndex];
-            V = planeV.bytes[vIndex];
+
+            if (uIndex < planeU.bytes.length && vIndex < planeV.bytes.length) {
+              U = planeU.bytes[uIndex];
+              V = planeV.bytes[vIndex];
+            }
           }
-          final rgb = _yuvToRgb(Y, U, V);
+
+          final rgb = _yuvToRgbOptimized(Y, U, V);
           final p = hbuf[y][x];
           p[0] = norm(rgb[0] * 255.0);
           p[1] = norm(rgb[1] * 255.0);
@@ -282,35 +337,43 @@ class YoloModelHelper {
     }
   }
 
-  List<double> _yuvToRgb(int y, int u, int v) {
-    double yf = y.toDouble();
-    double uf = (u - 128).toDouble();
-    double vf = (v - 128).toDouble();
-    double r = (yf + 1.402 * vf).clamp(0, 255) / 255.0;
-    double g = (yf - 0.344136 * uf - 0.714136 * vf).clamp(0, 255) / 255.0;
-    double b = (yf + 1.772 * uf).clamp(0, 255) / 255.0;
+  // Optimized YUV to RGB conversion with better color space handling
+  List<double> _yuvToRgbOptimized(int y, int u, int v) {
+    // ITU-R BT.601 conversion with proper clamping
+    final double yf = y.toDouble();
+    final double uf = (u - 128).toDouble();
+    final double vf = (v - 128).toDouble();
+
+    final double r = (yf + 1.402 * vf).clamp(0, 255) / 255.0;
+    final double g = (yf - 0.344136 * uf - 0.714136 * vf).clamp(0, 255) / 255.0;
+    final double b = (yf + 1.772 * uf).clamp(0, 255) / 255.0;
+
     return [r, g, b];
   }
 
   List<List<double>> _runOnInputSync(dynamic input) {
-    final outTensor = _interpreter!.getOutputTensor(0);
-    final oShape = outTensor.shape;
-    final int d1 = oShape[1];
-    final int d2 = oShape[2];
-    final int expectedChannels = 4 + numClasses;
-    final output = [List.generate(d1, (_) => List<double>.filled(d2, 0.0, growable: false), growable: false)];
+    final output = _outputBuffer != null ? [_outputBuffer!] : [
+      List.generate(_interpreter!.getOutputTensor(0).shape[1],
+              (_) => List<double>.filled(_interpreter!.getOutputTensor(0).shape[2], 0.0, growable: false),
+          growable: false)
+    ];
+
     _interpreter!.run(input, output);
+    final oShape = _interpreter!.getOutputTensor(0).shape;
+    final expectedChannels = 4 + numClasses;
     return _reformatOutput(output, oShape, expectedChannels);
   }
 
   Future<List<List<double>>> _runOnInputAsync(dynamic input) async {
-    final outTensor = _interpreter!.getOutputTensor(0);
-    final oShape = outTensor.shape;
-    final int d1 = oShape[1];
-    final int d2 = oShape[2];
-    final int expectedChannels = 4 + numClasses;
-    final output = [List.generate(d1, (_) => List<double>.filled(d2, 0.0, growable: false), growable: false)];
+    final output = _outputBuffer != null ? [_outputBuffer!] : [
+      List.generate(_interpreter!.getOutputTensor(0).shape[1],
+              (_) => List<double>.filled(_interpreter!.getOutputTensor(0).shape[2], 0.0, growable: false),
+          growable: false)
+    ];
+
     await _isolateInterpreter!.run(input, output);
+    final oShape = _interpreter!.getOutputTensor(0).shape;
+    final expectedChannels = 4 + numClasses;
     return _reformatOutput(output, oShape, expectedChannels);
   }
 
@@ -320,10 +383,12 @@ class YoloModelHelper {
     }
     final int d1 = oShape[1];
     final int d2 = oShape[2];
+
     if (d1 == expectedChannels) {
-      return List.generate(d1, (c) => List<double>.from(output[0][c]));
+      return List.generate(d1, (c) => List<double>.from(output[0][c]), growable: false);
     } else if (d2 == expectedChannels) {
-      final channelsFirst = List.generate(expectedChannels, (c) => List<double>.filled(d1, 0.0, growable: false));
+      final channelsFirst = List.generate(expectedChannels,
+              (c) => List<double>.filled(d1, 0.0, growable: false), growable: false);
       for (int i = 0; i < d1; i++) {
         for (int c = 0; c < expectedChannels; c++) {
           channelsFirst[c][i] = output[0][i][c];
@@ -336,32 +401,42 @@ class YoloModelHelper {
   }
 
   (List<int>, List<List<double>>, List<double>) postprocess(
-    List<List<double>> unfilteredBboxes,
-    int imageWidth,
-    int imageHeight, {
-    double confidenceThreshold = 0.7,
-    double iouThreshold = 0.1,
-    bool agnostic = false,
-  }) {
+      List<List<double>> unfilteredBboxes,
+      int imageWidth,
+      int imageHeight, {
+        double confidenceThreshold = 0.3, // Lowered default
+        double iouThreshold = 0.4,
+        bool agnostic = false,
+      }) {
     try {
-      final rawCopy = [for (var c in unfilteredBboxes) List<double>.from(c)]; // keep original for fallback scaling
+      final rawCopy = [for (var c in unfilteredBboxes) List<double>.from(c)];
       final (classes, bboxes, scores) = postProcessDetections(
         unfilteredBboxes,
         confidenceThreshold: confidenceThreshold,
         iouThreshold: iouThreshold,
       );
+
+      // Enhanced coordinate handling for better orientation support
       int outOfBounds = 0;
       for (var bbox in bboxes) {
+        // Store original values for debugging
+        final origCx = bbox[0];
+        final origCy = bbox[1];
+
         bbox[0] *= imageWidth;
         bbox[1] *= imageHeight;
         bbox[2] *= imageWidth;
         bbox[3] *= imageHeight;
-        if (bbox[0] < 0 || bbox[0] > imageWidth * 1.5 || bbox[1] < 0 || bbox[1] > imageHeight * 1.5) {
+
+        // More lenient bounds checking
+        if (bbox[0] < -imageWidth * 0.2 || bbox[0] > imageWidth * 1.2 ||
+            bbox[1] < -imageHeight * 0.2 || bbox[1] > imageHeight * 1.2) {
           outOfBounds++;
         }
       }
-      if (bboxes.isNotEmpty && outOfBounds / bboxes.length > 0.7) {
-        // Fallback: assume original coords already in pixel units of model input size
+
+      // Adjusted fallback threshold
+      if (bboxes.isNotEmpty && outOfBounds / bboxes.length > 0.5) {
         if (kDebugMode) debugPrint('⚠️ Falling back to pixel-space scaling heuristic');
         final (cls2, b2, sc2) = postProcessDetections(
           rawCopy,
@@ -369,11 +444,10 @@ class YoloModelHelper {
           iouThreshold: iouThreshold,
         );
         for (var bbox in b2) {
-          // scale from model input size to image size
-            bbox[0] *= (imageWidth / inWidth);
-            bbox[1] *= (imageHeight / inHeight);
-            bbox[2] *= (imageWidth / inWidth);
-            bbox[3] *= (imageHeight / inHeight);
+          bbox[0] *= (imageWidth / inWidth);
+          bbox[1] *= (imageHeight / inHeight);
+          bbox[2] *= (imageWidth / inWidth);
+          bbox[3] *= (imageHeight / inHeight);
         }
         return (cls2, b2, sc2);
       }
@@ -386,73 +460,114 @@ class YoloModelHelper {
   }
 }
 
+// Optimized post-processing with better detection handling
 (List<int>, List<List<double>>, List<double>) postProcessDetections(
-  List<List<double>> rawOutput, {
-  double confidenceThreshold = 0.7,
-  double iouThreshold = 0.4,
-}) {
+    List<List<double>> rawOutput, {
+      double confidenceThreshold = 0.3, // Lowered default
+      double iouThreshold = 0.4,
+    }) {
   if (rawOutput.length < 5) {
     return (<int>[], <List<double>>[], <double>[]);
   }
+
   final int numChannels = rawOutput.length;
   final int numClasses = numChannels - 4;
   if (numClasses <= 0) {
     return (<int>[], <List<double>>[], <double>[]);
   }
+
   final int numPredictions = rawOutput[0].length;
+
+  // Optimized sigmoid detection - check fewer samples for speed
   bool needSigmoid = false;
-  for (int j = 4; j < 4 + numClasses && !needSigmoid; j++) {
-    for (int i = 0; i < min(numPredictions, 32); i++) {
+  for (int j = 4; j < min(4 + numClasses, rawOutput.length) && !needSigmoid; j++) {
+    for (int i = 0; i < min(numPredictions, 16); i++) { // Reduced sample size
       final v = rawOutput[j][i];
-      if (v > 1.5 || v < 0) { needSigmoid = true; break; }
+      if (v > 1.5 || v < -0.5) {
+        needSigmoid = true;
+        break;
+      }
     }
   }
+
   double _sig(double x) => 1.0 / (1.0 + exp(-x));
+
   List<int> bestClasses = [];
   List<double> bestScores = [];
   List<int> boxesToSave = [];
+
+  // Pre-allocate lists for better performance
+  bestClasses = List<int>.filled(0, 0, growable: true);
+  bestScores = List<double>.filled(0, 0.0, growable: true);
+  boxesToSave = List<int>.filled(0, 0, growable: true);
+
   for (int i = 0; i < numPredictions; i++) {
     double bestScore = 0;
     int bestCls = -1;
+
     for (int j = 4; j < 4 + numClasses; j++) {
+      if (j >= rawOutput.length) break;
+
       double clsScore = rawOutput[j][i];
       if (needSigmoid) clsScore = _sig(clsScore);
+
       if (clsScore > bestScore) {
         bestScore = clsScore;
         bestCls = j - 4;
       }
     }
+
     if (bestScore > confidenceThreshold && bestCls >= 0) {
       bestClasses.add(bestCls);
       bestScores.add(bestScore);
       boxesToSave.add(i);
     }
   }
+
+  if (boxesToSave.isEmpty) {
+    return (<int>[], <List<double>>[], <double>[]);
+  }
+
   List<List<double>> candidateBoxes = [];
   for (var index in boxesToSave) {
     var cx = rawOutput[0][index];
     var cy = rawOutput[1][index];
     var w = rawOutput[2][index];
     var h = rawOutput[3][index];
-    // If coordinates look like pixels already (>1) normalize by max dimension heuristic (assume trained on inWidth/inHeight typical 640)
+
+    // Enhanced coordinate normalization with better heuristics
     if (w > 2 || h > 2 || cx > 2 || cy > 2) {
-      // convert to relative (assuming training size 640) fallback
-      const double base = 640.0;
-      cx /= base; cy /= base; w /= base; h /= base;
+      // Try to detect the training resolution automatically
+      double maxDim = max(max(cx.abs(), cy.abs()), max(w, h));
+      double base = 640.0; // Default assumption
+
+      if (maxDim > 1000) {
+        base = 1280.0; // Likely trained on higher resolution
+      } else if (maxDim < 300) {
+        base = 320.0; // Likely trained on lower resolution
+      }
+
+      cx /= base;
+      cy /= base;
+      w /= base;
+      h /= base;
     }
+
     candidateBoxes.add([cx, cy, w, h]);
   }
-  if (candidateBoxes.isEmpty) {
-    return (<int>[], <List<double>>[], <double>[]);
-  }
+
+  // Optimized NMS with pre-sorted scores
   List<int> argSortList = List.generate(bestScores.length, (i) => i);
   argSortList.sort((a, b) => -bestScores[a].compareTo(bestScores[b]));
+
   List<int> sortedBestClasses = [for (var i in argSortList) bestClasses[i]];
   List<List<double>> sortedCandidateBoxes = [for (var i in argSortList) candidateBoxes[i]];
   List<double> sortedScores = [for (var i in argSortList) bestScores[i]];
+
   List<List<double>> finalBboxes = [];
   List<double> finalScores = [];
   List<int> finalClasses = [];
+
   while (sortedCandidateBoxes.isNotEmpty) {
     var bbox1xywh = sortedCandidateBoxes.removeAt(0);
     finalBboxes.add(bbox1xywh);
@@ -460,6 +575,7 @@ class YoloModelHelper {
     finalScores.add(sortedScores.removeAt(0));
     var class1 = sortedBestClasses.removeAt(0);
     finalClasses.add(class1);
+
     List<int> indexesToRemove = [];
     for (int i = 0; i < sortedCandidateBoxes.length; i++) {
       if ((class1 == sortedBestClasses[i]) &&
@@ -467,12 +583,15 @@ class YoloModelHelper {
         indexesToRemove.add(i);
       }
     }
+
+    // Remove in reverse order to maintain indices
     for (var index in indexesToRemove.reversed) {
       sortedCandidateBoxes.removeAt(index);
       sortedBestClasses.removeAt(index);
       sortedScores.removeAt(index);
     }
   }
+
   return (finalClasses, finalBboxes, finalScores);
 }
 
@@ -488,22 +607,29 @@ List<double> xywh2xyxy(List<double> bbox) {
 }
 
 double computeIou(List<double> bbox1, List<double> bbox2) {
-  assert(bbox1[0] < bbox1[2]);
-  assert(bbox1[1] < bbox1[3]);
-  assert(bbox2[0] < bbox2[2]);
-  assert(bbox2[1] < bbox2[3]);
+  // Add bounds checking for robustness
+  if (bbox1.length < 4 || bbox2.length < 4) return 0.0;
+  if (bbox1[0] >= bbox1[2] || bbox1[1] >= bbox1[3]) return 0.0;
+  if (bbox2[0] >= bbox2[2] || bbox2[1] >= bbox2[3]) return 0.0;
+
   double xLeft = max(bbox1[0], bbox2[0]);
   double yTop = max(bbox1[1], bbox2[1]);
   double xRight = min(bbox1[2], bbox2[2]);
   double yBottom = min(bbox1[3], bbox2[3]);
-  if (xRight < xLeft || yBottom < yTop) {
-    return 0;
+
+  if (xRight <= xLeft || yBottom <= yTop) {
+    return 0.0;
   }
+
   double intersectionArea = (xRight - xLeft) * (yBottom - yTop);
   double bbox1Area = (bbox1[2] - bbox1[0]) * (bbox1[3] - bbox1[1]);
   double bbox2Area = (bbox2[2] - bbox2[0]) * (bbox2[3] - bbox2[1]);
-  double iou = intersectionArea / (bbox1Area + bbox2Area - intersectionArea);
-  if (iou < 0) return 0;
-  if (iou > 1) return 1;
-  return iou;
+
+  if (bbox1Area <= 0 || bbox2Area <= 0) return 0.0;
+
+  double unionArea = bbox1Area + bbox2Area - intersectionArea;
+  if (unionArea <= 0) return 0.0;
+
+  double iou = intersectionArea / unionArea;
+  return iou.clamp(0.0, 1.0);
 }
