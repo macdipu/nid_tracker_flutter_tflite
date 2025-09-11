@@ -301,20 +301,17 @@ class _LiveDetectPageState extends State<LiveDetectPage> with WidgetsBindingObse
     super.dispose();
   }
 
-  // Improved orientation handling
-  List<double> _mapBox(double cx, double cy, double w, double h, int rotation, int rawW, int rawH) {
-    // Handle different camera orientations more robustly
-    switch (rotation) {
-      case 90:
-        return [cy, rawW - cx, h, w];
-      case 270:
-        return [rawH - cy, cx, h, w];
-      case 180:
-        return [rawW - cx, rawH - cy, w, h];
-      default:
-        return [cx, cy, w, h];
-    }
+// cx, cy, w, h are in absolute pixels (from model output after scaling to rawW/rawH)
+  List<double> _mapBox(double cx, double cy, double w, double h, int rawW, int rawH,
+      double scaleX, double scaleY) {
+    // Just scale to preview size, no rotation flipping
+    final left = cx * scaleX;
+    final top = cy * scaleY;
+    final width = w * scaleX;
+    final height = h * scaleY;
+    return [left, top, width, height];
   }
+
 
   Widget _buildDetectionInfo() {
     final totalClasses = widget.model.numClasses;
@@ -427,11 +424,13 @@ class _LiveDetectPageState extends State<LiveDetectPage> with WidgetsBindingObse
         for (int i = 0; i < _bboxes.length; i++) {
           final b = _bboxes[i];
           if (b.isEmpty) continue;
-          final m = _mapBox(b[0], b[1], b[2], b[3], rotation, rawW, rawH);
-          final sx = m[0] * scaleX;
-          final sy = m[1] * scaleY;
-          final sw = m[2] * scaleX;
-          final sh = m[3] * scaleY;
+          // Instead of rotation mapping, just map directly
+          final m = _mapBox(b[0], b[1], b[2], b[3], rawW, rawH, scaleX, scaleY);
+          final sx = m[0];
+          final sy = m[1];
+          final sw = m[2];
+          final sh = m[3];
+
           final cls = (i < _classes.length) ? _classes[i] : -1;
           _ensureColor(cls < 0 ? 0 : cls);
 
