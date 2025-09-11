@@ -93,7 +93,7 @@ class _LiveDetectPageState extends State<LiveDetectPage> with WidgetsBindingObse
       final cam = backCamera ?? cams.first;
       _controller = CameraController(
         cam,
-        ResolutionPreset.medium, // Consider using 'high' for better detection
+        ResolutionPreset.ultraHigh, // Consider using 'high' for better detection
         enableAudio: false,
         imageFormatGroup: ImageFormatGroup.yuv420,
       );

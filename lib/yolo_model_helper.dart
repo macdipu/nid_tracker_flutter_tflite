@@ -135,7 +135,7 @@ class YoloModelHelper {
         double confidenceThreshold = 0.3, // Lowered for better detection
         double iouThreshold = 0.4,
         bool agnostic = false,
-        int processEveryNFrames = 1,
+        int processEveryNFrames = 3,
       }) async {
     if (!_initialized) return null;
 
