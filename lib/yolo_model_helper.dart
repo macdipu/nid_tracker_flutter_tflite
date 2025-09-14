@@ -136,6 +136,8 @@ class YoloModelHelper {
         double iouThreshold = 0.4,
         bool agnostic = false,
         int processEveryNFrames = 3,
+        bool tryRotationFallback = true, // run a 90°-rotated pass too
+        int preferClassIndex = -1, // prefer results containing this class
       }) async {
     if (!_initialized) return null;
 
@@ -145,10 +147,11 @@ class YoloModelHelper {
     final Stopwatch sw = Stopwatch()..start();
 
     try {
-      final dynamic input = _preprocessCameraImageOptimized(cameraImage);
-      final preds = await _runOnInputAsync(input);
-      final (classes, bboxes, scores) = postprocess(
-        preds,
+      // 0° pass
+      final dynamic input0 = _preprocessCameraImageOptimized(cameraImage);
+      final preds0 = await _runOnInputAsync(input0);
+      var (classes0, bboxes0, scores0) = postprocess(
+        preds0,
         cameraImage.width,
         cameraImage.height,
         confidenceThreshold: confidenceThreshold,
@@ -156,11 +159,64 @@ class YoloModelHelper {
         agnostic: agnostic,
       );
 
-      if (kDebugMode && sw.elapsedMilliseconds > 100) {
-        debugPrint('📷 Slow frame: ${sw.elapsedMilliseconds}ms det=${bboxes.length}');
+      if (!tryRotationFallback) {
+        if (kDebugMode && sw.elapsedMilliseconds > 100) {
+          debugPrint('📷 Slow frame: ${sw.elapsedMilliseconds}ms det=${bboxes0.length}');
+        }
+        return (classes0, bboxes0, scores0);
       }
 
-      return (classes, bboxes, scores);
+      // 90° clockwise rotated pass (reuse preprocessed buffer, rotate tensor)
+      (List<int>, List<List<double>>, List<double>)? rotatedRes;
+      try {
+        final rotatedInput = _rotatePreprocessedInput90(input0, clockwise: true);
+        final preds90 = await _runOnInputAsync(rotatedInput);
+        var (cls90, b90, sc90) = postprocess(
+          preds90,
+          cameraImage.height, // swapped because input is rotated
+          cameraImage.width,
+          confidenceThreshold: confidenceThreshold,
+          iouThreshold: iouThreshold,
+          agnostic: agnostic,
+        );
+        // map 90° results back to original camera orientation
+        b90 = _mapRotatedBboxesBack(b90, cameraImage.width, cameraImage.height, clockwise: true);
+        rotatedRes = (cls90, b90, sc90);
+      } catch (e) {
+        // if rotation path fails for any reason, ignore it
+        rotatedRes = null;
+      }
+
+      double scoreOf(List<int> cls, List<double> sc) {
+        double s = 0.0;
+        for (final v in sc) s += v;
+        s += cls.length * 0.05; // slight preference to more boxes
+        if (preferClassIndex >= 0 && cls.contains(preferClassIndex)) s += 1.0;
+        return s;
+      }
+
+      final baseScore = scoreOf(classes0, scores0);
+      final rotScore = rotatedRes != null ? scoreOf(rotatedRes.$1, rotatedRes.$3) : double.negativeInfinity;
+
+      final useRotated =
+          rotatedRes != null &&
+          ( // prefer presence of target class
+            (preferClassIndex >= 0 &&
+             rotatedRes!.$1.contains(preferClassIndex) &&
+             !classes0.contains(preferClassIndex)) ||
+            // otherwise pick higher aggregate score
+            (rotScore > baseScore)
+          );
+
+      if (kDebugMode && sw.elapsedMilliseconds > 100) {
+        debugPrint('📷 Slow frame: ${sw.elapsedMilliseconds}ms det0=${bboxes0.length} det90=${rotatedRes?.$2.length ?? 0} chosen=${useRotated ? "90°" : "0°"}');
+      }
+
+      if (useRotated) {
+        return rotatedRes!;
+      } else {
+        return (classes0, bboxes0, scores0);
+      }
     } catch (e) {
       debugPrint('❌ Camera inference error: $e');
       return null;
@@ -349,6 +405,104 @@ class YoloModelHelper {
     final double b = (yf + 1.772 * uf).clamp(0, 255) / 255.0;
 
     return [r, g, b];
+  }
+
+  // Rotate the preprocessed input tensor by 90 degrees.
+  // Works for both NHWC [1,H,W,3] and NCHW [1,3,H,W].
+  // If input width != height, returns the original input without rotation.
+  dynamic _rotatePreprocessedInput90(dynamic input, {bool clockwise = true}) {
+    if (inWidth != inHeight) {
+      // rotation would swap dimensions; our interpreter is square (typical for YOLO),
+      // so in non-square cases skip rotation fallback.
+      return input;
+    }
+
+    if (_channelsFirst) {
+      // input: [1][3][H][W]
+      final src = input[0] as List; // [3][H][W]
+      final H = inHeight;
+      final W = inWidth;
+
+      final dst = [
+        [
+          List.generate(H, (_) => List<double>.filled(W, 0.0, growable: false)),
+          List.generate(H, (_) => List<double>.filled(W, 0.0, growable: false)),
+          List.generate(H, (_) => List<double>.filled(W, 0.0, growable: false)),
+        ]
+      ];
+
+      for (int c = 0; c < 3; c++) {
+        for (int y = 0; y < H; y++) {
+          for (int x = 0; x < W; x++) {
+            final v = src[c][y][x] as double;
+            int ny, nx;
+            if (clockwise) {
+              ny = x;
+              nx = W - 1 - y;
+            } else {
+              ny = H - 1 - x;
+              nx = y;
+            }
+            dst[0][c][ny][nx] = v;
+          }
+        }
+      }
+      return dst;
+    } else {
+      // input: [1][H][W][3]
+      final src = input[0] as List; // [H][W][3]
+      final H = inHeight;
+      final W = inWidth;
+
+      final dst = [
+        List.generate(H, (_) => List.generate(W, (_) => List<double>.filled(3, 0.0, growable: false), growable: false), growable: false)
+      ];
+
+      for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+          final p = src[y][x] as List; // [3]
+          int ny, nx;
+          if (clockwise) {
+            ny = x;
+            nx = W - 1 - y;
+          } else {
+            ny = H - 1 - x;
+            nx = y;
+          }
+          final outP = dst[0][ny][nx] as List<double>;
+          outP[0] = p[0] as double;
+          outP[1] = p[1] as double;
+          outP[2] = p[2] as double;
+        }
+      }
+      return dst;
+    }
+  }
+
+  // Map bboxes (cx,cy,w,h in pixels) predicted on a 90°-rotated frame
+  // back to the original camera orientation.
+  List<List<double>> _mapRotatedBboxesBack(List<List<double>> boxes, int rawW, int rawH, {bool clockwise = true}) {
+    final out = <List<double>>[];
+    for (final b in boxes) {
+      if (b.length < 4) continue;
+      final cx = b[0];
+      final cy = b[1];
+      final w  = b[2];
+      final h  = b[3];
+
+      double nx, ny, nw, nh;
+      if (clockwise) {
+        nx = rawW - cy;
+        ny = cx;
+      } else {
+        nx = cy;
+        ny = rawH - cx;
+      }
+      nw = h;
+      nh = w;
+      out.add([nx, ny, nw, nh]);
+    }
+    return out;
   }
 
   List<List<double>> _runOnInputSync(dynamic input) {
