@@ -1,10 +1,8 @@
 import 'dart:async';
 import 'dart:math';
-import 'dart:typed_data';
-import 'dart:ui' as ui;
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart';
+import 'package:flutter/services.dart';
 import 'bbox.dart';
 import 'yolo_model_helper.dart';
 
@@ -56,6 +54,10 @@ class _LiveDetectPageState extends State<LiveDetectPage> with WidgetsBindingObse
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    // Lock to portrait for consistent UI
+    SystemChrome.setPreferredOrientations([
+      DeviceOrientation.portraitUp,
+    ]);
     _fpsStart = DateTime.now();
     _initTargetLabelIndex();
     _initCamera();
@@ -295,23 +297,50 @@ class _LiveDetectPageState extends State<LiveDetectPage> with WidgetsBindingObse
 
   @override
   void dispose() {
+    // Restore orientations
+    SystemChrome.setPreferredOrientations(DeviceOrientation.values);
     WidgetsBinding.instance.removeObserver(this);
     _fpsTimer?.cancel();
     _controller?.dispose();
     super.dispose();
   }
 
-// cx, cy, w, h are in absolute pixels (from model output after scaling to rawW/rawH)
-  List<double> _mapBox(double cx, double cy, double w, double h, int rawW, int rawH,
-      double scaleX, double scaleY) {
-    // Just scale to preview size, no rotation flipping
-    final left = cx * scaleX;
-    final top = cy * scaleY;
-    final width = w * scaleX;
-    final height = h * scaleY;
-    return [left, top, width, height];
-  }
+  // Replace _mapBox with rotation-aware center->rect transform
+  List<double> _transformBoxForDisplay(List<double> bb, int rotation, int rawW, int rawH) {
+    double cx = bb[0];
+    double cy = bb[1];
+    double w = bb[2];
+    double h = bb[3];
 
+    double tCx, tCy, tW, tH;
+    switch (rotation) {
+      case 90: // sensor rotated clockwise; rotate coords CCW for portrait
+        tCx = cy;
+        tCy = rawW - cx;
+        tW = h;
+        tH = w;
+        break;
+      case 270: // sensor rotated counter-clockwise
+        tCx = rawH - cy;
+        tCy = cx;
+        tW = h;
+        tH = w;
+        break;
+      case 180:
+        tCx = rawW - cx;
+        tCy = rawH - cy;
+        tW = w;
+        tH = h;
+        break;
+      case 0:
+      default:
+        tCx = cx;
+        tCy = cy;
+        tW = w;
+        tH = h;
+    }
+    return [tCx, tCy, tW, tH];
+  }
 
   Widget _buildDetectionInfo() {
     final totalClasses = widget.model.numClasses;
@@ -400,104 +429,80 @@ class _LiveDetectPageState extends State<LiveDetectPage> with WidgetsBindingObse
       body: _initializing || controller == null || !controller.value.isInitialized
           ? const Center(child: CircularProgressIndicator())
           : LayoutBuilder(builder: (context, constraints) {
-        final rotation = controller.description.sensorOrientation;
-        final previewSize = controller.value.previewSize!;
-        final rawW = _frameW ?? previewSize.width.toInt();
-        final rawH = _frameH ?? previewSize.height.toInt();
+              final rotation = controller.description.sensorOrientation; // 0,90,180,270
+              final previewSize = controller.value.previewSize!;
+              final rawW = _frameW ?? previewSize.width.toInt();
+              final rawH = _frameH ?? previewSize.height.toInt();
 
-        // Improved orientation handling
-        final rotatedW = (rotation == 90 || rotation == 270) ? rawH.toDouble() : rawW.toDouble();
-        final rotatedH = (rotation == 90 || rotation == 270) ? rawW.toDouble() : rawH.toDouble();
-        final rotatedAspect = rotatedW / rotatedH;
+              // Dimensions after rotating preview to portrait
+              final rotatedW = (rotation == 90 || rotation == 270) ? rawH.toDouble() : rawW.toDouble();
+              final rotatedH = (rotation == 90 || rotation == 270) ? rawW.toDouble() : rawH.toDouble();
+              final aspect = rotatedW / rotatedH;
 
-        double displayW = constraints.maxWidth;
-        double displayH = displayW / rotatedAspect;
-        if (displayH > constraints.maxHeight) {
-          displayH = constraints.maxHeight;
-          displayW = displayH * rotatedAspect;
-        }
+              double displayW = constraints.maxWidth;
+              double displayH = displayW / aspect;
+              if (displayH > constraints.maxHeight) {
+                displayH = constraints.maxHeight;
+                displayW = displayH * aspect;
+              }
 
-        final scaleX = displayW / rotatedW;
-        final scaleY = displayH / rotatedH;
+              final scaleX = displayW / rotatedW;
+              final scaleY = displayH / rotatedH;
 
-        final boxes = <Widget>[];
-        for (int i = 0; i < _bboxes.length; i++) {
-          final b = _bboxes[i];
-          if (b.isEmpty) continue;
-          // Instead of rotation mapping, just map directly
-          final m = _mapBox(b[0], b[1], b[2], b[3], rawW, rawH, scaleX, scaleY);
-          final sx = m[0];
-          final sy = m[1];
-          final sw = m[2];
-          final sh = m[3];
+              final boxes = <Widget>[];
+              for (int i = 0; i < _bboxes.length; i++) {
+                final bb = _bboxes[i];
+                if (bb.length < 4) continue;
+                final t = _transformBoxForDisplay(bb, rotation, rawW, rawH);
+                final left = t[0] * scaleX - (t[2] * scaleX) / 2;
+                final top = t[1] * scaleY - (t[3] * scaleY) / 2;
+                final bw = t[2] * scaleX;
+                final bh = t[3] * scaleY;
+                final cls = i < _classes.length ? _classes[i] : -1;
+                _ensureColor(cls < 0 ? 0 : cls);
+                String label = '';
+                if (cls >= 0 && cls < widget.model.labels.length) label = widget.model.labels[cls];
+                Color boxColor = _colors[(cls < 0 ? 0 : cls) % _colors.length];
+                if (cls == _targetLabelIndex) boxColor = Colors.green;
+                boxes.add(Positioned(
+                  left: left,
+                  top: top,
+                  width: bw,
+                  height: bh,
+                  child: Bbox(left + bw / 2, top + bh / 2, bw, bh, label, _scores[i], boxColor),
+                ));
+              }
 
-          final cls = (i < _classes.length) ? _classes[i] : -1;
-          _ensureColor(cls < 0 ? 0 : cls);
-
-          // Get label name
-          String label = '';
-          if (cls >= 0 && cls < widget.model.labels.length) {
-            label = widget.model.labels[cls];
-          }
-
-          // Highlight target label
-          Color boxColor = _colors[(cls < 0 ? 0 : cls) % _colors.length];
-          if (cls == _targetLabelIndex) {
-            boxColor = Colors.green; // Highlight target in green
-          }
-
-          boxes.add(Bbox(sx, sy, sw, sh, label, _scores[i], boxColor));
-          boxes.reversed;
-        }
-
-        return Center(
-          child: SizedBox(
-            width: displayW,
-            height: displayH,
-            child: Stack(
-              fit: StackFit.expand,
-              children: [
-                RepaintBoundary(
-                  key: _previewKey,
-                  child: ClipRect(
-                    child: FittedBox(
-                      fit: BoxFit.contain,
-                      child: SizedBox(
-                        width: rotatedW,
-                        height: rotatedH,
-                        child: CameraPreview(controller),
-                      ),
-                    ),
-                  ),
-                ),
-                ...boxes,
-                Positioned(
-                  left: 0,
-                  top: 0,
-                  child: _buildDetectionInfo(),
-                ),
-                if (_captureInProgress)
-                  Container(
-                    color: Colors.black54,
-                    child: const Center(
-                      child: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          CircularProgressIndicator(color: Colors.white),
-                          SizedBox(height: 16),
-                          Text(
-                            'Capturing target region...',
-                            style: TextStyle(color: Colors.white, fontSize: 16),
+              // Render camera directly within the correctly sized box to avoid distortion
+              return Center(
+                child: SizedBox(
+                  width: displayW,
+                  height: displayH,
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      CameraPreview(controller),
+                      ...boxes,
+                      Positioned(left: 0, top: 0, child: _buildDetectionInfo()),
+                      if (_captureInProgress)
+                        Container(
+                          color: Colors.black54,
+                          child: const Center(
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                CircularProgressIndicator(color: Colors.white),
+                                SizedBox(height: 16),
+                                Text('Capturing target region...', style: TextStyle(color: Colors.white, fontSize: 16)),
+                              ],
+                            ),
                           ),
-                        ],
-                      ),
-                    ),
+                        ),
+                    ],
                   ),
-              ],
-            ),
-          ),
-        );
-      }),
+                ),
+              );
+            }),
       floatingActionButton: Column(
         mainAxisAlignment: MainAxisAlignment.end,
         children: [
