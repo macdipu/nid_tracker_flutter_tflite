@@ -453,24 +453,28 @@ class _LiveDetectPageState extends State<LiveDetectPage> with WidgetsBindingObse
               for (int i = 0; i < _bboxes.length; i++) {
                 final bb = _bboxes[i];
                 if (bb.length < 4) continue;
-                final t = _transformBoxForDisplay(bb, rotation, rawW, rawH);
-                final left = t[0] * scaleX - (t[2] * scaleX) / 2;
-                final top = t[1] * scaleY - (t[3] * scaleY) / 2;
+                final t = _transformBoxForDisplay(bb, rotation, rawW, rawH); // [cx, cy, w, h] in raw space
                 final bw = t[2] * scaleX;
                 final bh = t[3] * scaleY;
+                final cx = t[0] * scaleX;
+                final cy = t[1] * scaleY;
                 final cls = i < _classes.length ? _classes[i] : -1;
                 _ensureColor(cls < 0 ? 0 : cls);
                 String label = '';
                 if (cls >= 0 && cls < widget.model.labels.length) label = widget.model.labels[cls];
                 Color boxColor = _colors[(cls < 0 ? 0 : cls) % _colors.length];
                 if (cls == _targetLabelIndex) boxColor = Colors.green;
-                boxes.add(Positioned(
-                  left: left,
-                  top: top,
-                  width: bw,
-                  height: bh,
-                  child: Bbox(left + bw / 2, top + bh / 2, bw, bh, label, _scores[i], boxColor),
-                ));
+                boxes.add(
+                  Bbox(
+                    cx,
+                    cy,
+                    bw,
+                    bh,
+                    label,
+                    _scores[i],
+                    boxColor,
+                  ),
+                );
               }
 
               // Render camera directly within the correctly sized box to avoid distortion
@@ -564,3 +568,4 @@ class _LiveDetectPageState extends State<LiveDetectPage> with WidgetsBindingObse
     );
   }
 }
+
