@@ -512,7 +512,9 @@ class YoloModelHelper {
           growable: false)
     ];
 
-    _interpreter!.run(input, output);
+    // Updated to use runForMultipleInputs for consistency/future multi-input extensibility
+    final outputs = <int, Object>{0: output};
+    _interpreter!.runForMultipleInputs([input], outputs);
     final oShape = _interpreter!.getOutputTensor(0).shape;
     final expectedChannels = 4 + numClasses;
     return _reformatOutput(output, oShape, expectedChannels);

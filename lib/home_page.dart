@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:nid_tracker_flutter_tflite/yolo_model_helper.dart';
+import 'package:nid_tracker_flutter_tflite/yolo_model_helper_minimal.dart';
 import 'image_detect_page.dart';
 import 'live_detect_page.dart';
+import 'live_detect_page_minimal.dart' show LiveDetectPageMinimal;
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -12,6 +14,7 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   late final YoloModelHelper model;
+  late final YoloModelMinimal model2;
   bool _loading = true;
   String? _error;
 
@@ -24,12 +27,19 @@ class _HomePageState extends State<HomePage> {
       inHeight: 640,
       inWidth: 640,
     );
+    model2 = YoloModelMinimal(
+      modelPath: 'assets/models/yolov11n.tflite',
+      labelsPath: 'assets/models/labels.txt',
+      inputWidth: 640,
+      inputHeight: 640,
+    );
     _init();
   }
 
   Future<void> _init() async {
     try {
       await model.init();
+      await model2.init();
       if (mounted) setState(() => _loading = false);
     } catch (e) {
       if (mounted) setState(() { _error = e.toString(); _loading = false; });
@@ -69,6 +79,17 @@ class _HomePageState extends State<HomePage> {
                           context,
                           MaterialPageRoute(
                             builder: (_) => LiveDetectPage(model: model),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 24),
+                      ElevatedButton.icon(
+                        icon: const Icon(Icons.videocam_outlined),
+                        label: const Text('Live Camera Detection Minimal'),
+                        onPressed: () => Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => LiveDetectPageMinimal(model: model2),
                           ),
                         ),
                       ),
