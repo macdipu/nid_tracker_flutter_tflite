@@ -29,8 +29,6 @@ class _LiveDetectPageState extends State<LiveDetectPage> with WidgetsBindingObse
   double _fps = 0;
   DateTime _fpsStart = DateTime.now();
   Timer? _fpsTimer;
-
-  // Simple throttle: process every Nth frame
   static const int _processEvery = 2;
   int _frameSkip = 0;
 

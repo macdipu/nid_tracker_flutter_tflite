@@ -28,7 +28,7 @@ class YoloModelHelper {
     required this.labelsPath,
     required this.inputWidth,
     required this.inputHeight,
-    this.confThreshold = 0.4,
+    this.confThreshold = 0.8,
     this.iouThreshold = 0.45,
   });
 

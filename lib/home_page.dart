@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:nid_tracker_flutter_tflite/yolo_model_helper.dart';
-import 'live_detect_page_minimal.dart' show LiveDetectPage;
+import 'live_detect_page.dart' show LiveDetectPage;
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
