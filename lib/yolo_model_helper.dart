@@ -1,5 +1,4 @@
 import 'dart:math';
-import 'package:flutter/foundation.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:image/image.dart';
 import 'package:flutter/services.dart' show rootBundle;
@@ -28,7 +27,7 @@ class YoloModelHelper {
     required this.labelsPath,
     required this.inputWidth,
     required this.inputHeight,
-    this.confThreshold = 0.8,
+    this.confThreshold = 0.6,
     this.iouThreshold = 0.45,
   });
 

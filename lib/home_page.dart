@@ -1,4 +1,6 @@
 import 'package:flutter/material.dart';
+import 'dart:typed_data';
+import 'package:nid_tracker_flutter_tflite/live_capture_page.dart';
 import 'package:nid_tracker_flutter_tflite/yolo_model_helper.dart';
 import 'live_detect_page.dart' show LiveDetectPage;
 
@@ -60,6 +62,51 @@ class _HomePageState extends State<HomePage> {
                             builder: (_) => LiveDetectPage(model: model),
                           ),
                         ),
+                      ),
+                      const SizedBox(height: 24),
+                      ElevatedButton.icon(
+                        icon: const Icon(Icons.videocam_outlined),
+                        label: const Text('Capture Nid (HQ)'),
+                        onPressed: () async {
+                          final requiredLabels = <String>[
+                            'nid_front_image',
+                            'name',
+                            'father_name',
+                            'mother_name',
+                            'dob',
+                            'nid_no',
+                            'signature',
+                          ];
+                          final bytes = await Navigator.push(
+                            context,
+                            MaterialPageRoute(
+                              builder: (_) => LiveCapturePage(
+                                model: model,
+                                requiredLabelNames: requiredLabels,
+                                targetLabelName: 'nid_front_image',
+                                useStillCapture: true,
+                                jpegQuality: 95,
+                              ),
+                            ),
+                          );
+                          if (!context.mounted) return;
+                          if (bytes is Uint8List) {
+                            // Show a simple preview dialog
+                            await showDialog(
+                              context: context,
+                              builder: (_) => AlertDialog(
+                                title: const Text('Captured Preview'),
+                                content: Image.memory(bytes),
+                                actions: [
+                                  TextButton(
+                                    onPressed: () => Navigator.pop(context),
+                                    child: const Text('Close'),
+                                  ),
+                                ],
+                              ),
+                            );
+                          }
+                        },
                       ),
                     ],
                   ),
