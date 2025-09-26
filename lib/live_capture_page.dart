@@ -21,6 +21,12 @@ class LiveCapturePage extends StatefulWidget {
   final bool useStillCapture;
   // JPEG quality for saved/cropped image
   final int jpegQuality;
+  // Show all detected bounding boxes
+  final bool showAllBoxes;
+  // When showAllBoxes is false, still show target capture box if detected
+  final bool showTargetBox;
+  // Enable automatic capture when all required labels are present
+  final bool autoCapture;
 
   const LiveCapturePage({
     super.key,
@@ -30,6 +36,9 @@ class LiveCapturePage extends StatefulWidget {
     this.captureOnce = true,
     this.useStillCapture = true,
     this.jpegQuality = 95,
+    this.showAllBoxes = true,
+    this.showTargetBox = true,
+    this.autoCapture = true,
   });
   @override
   State<LiveCapturePage> createState() => _LiveCapturePageState();
@@ -57,11 +66,22 @@ class _LiveCapturePageState extends State<LiveCapturePage> with WidgetsBindingOb
   Uint8List? _capturedBytes;
   bool _capturingStill = false;
 
+  // UI state toggles
+  late bool _showAllBoxes;
+  late bool _showTargetBox;
+  late bool _autoCapture;
+
+  // Keep last processed stream image for mapping and fallback
+  img.Image? _lastStreamImage;
+
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
+    _showAllBoxes = widget.showAllBoxes;
+    _showTargetBox = widget.showTargetBox;
+    _autoCapture = widget.autoCapture;
     _initCamera();
     _fpsTimer = Timer.periodic(const Duration(seconds: 1), (_) => _computeFps());
   }
@@ -108,6 +128,7 @@ class _LiveCapturePageState extends State<LiveCapturePage> with WidgetsBindingOb
     // Convert YUV -> RGB (naive, not optimized)
     final rgb = _yuv420ToImage(frame);
     if (rgb != null) {
+      _lastStreamImage = rgb;
       // Run inference
       final dets = widget.model.runOnImage(rgb)
           .where((d) => d.score >= _confTh)
@@ -115,7 +136,7 @@ class _LiveCapturePageState extends State<LiveCapturePage> with WidgetsBindingOb
       // assign colors
       for (final d in dets) _ensureColor(d.classIndex);
 
-      // Check capture condition: all required labels present
+      // Check capture condition
       final labels = widget.model.labels;
       final required = (widget.requiredLabelNames == null || widget.requiredLabelNames!.isEmpty)
           ? labels
@@ -124,70 +145,102 @@ class _LiveCapturePageState extends State<LiveCapturePage> with WidgetsBindingOb
                                 .toSet();
       final allPresent = required.every(detectedNames.contains);
 
-      if (allPresent) {
-        // Find target bbox
-        final targetIdx = labels.indexOf(widget.targetLabelName);
-        YoloDetection? bestTarget;
-        if (targetIdx >= 0) {
-          for (final d in dets) {
-            if (d.classIndex == targetIdx) {
-              if (bestTarget == null || d.score > bestTarget.score) bestTarget = d;
-            }
-          }
-        } else {
-          // Fallback: try by name matching from detectedNames
-          for (final d in dets) {
-            final name = (d.classIndex >= 0 && d.classIndex < labels.length) ? labels[d.classIndex] : '';
-            if (name == widget.targetLabelName) {
-              if (bestTarget == null || d.score > bestTarget.score) bestTarget = d;
-            }
-          }
-        }
-
+      if (_autoCapture && allPresent) {
+        final bestTarget = _findBestTarget(dets, labels);
         if (bestTarget != null && (!_captured || !widget.captureOnce)) {
-          if (widget.useStillCapture && _controller != null) {
-            // Stop stream and capture a high-res still, then crop mapped bbox
-            _controller!.stopImageStream();
-            _streaming = false;
-            _capturingStill = true;
-            if (mounted) setState(() {});
-            final target = bestTarget!; // capture non-null for closures
-            _captureStillAndCrop(target, rgb.width, rgb.height)
-                .catchError((e) async {
-                  debugPrint('Still capture failed: $e');
-                  // Fallback to stream crop
-                  final crop = _cropAround(rgb, target, padRatio: 0.06);
-                  final bytes = Uint8List.fromList(img.encodeJpg(crop, quality: widget.jpegQuality));
-                  _captured = true;
-                  _capturedBytes = bytes;
-                })
-                .whenComplete(() {
-                  _capturingStill = false;
-                  if (mounted) setState(() {});
-                });
-            _processing = false;
-            return;
-          } else {
-            // Crop image around bbox with small padding from stream frame
-            final crop = _cropAround(rgb, bestTarget, padRatio: 0.05);
-            final bytes = Uint8List.fromList(img.encodeJpg(crop, quality: widget.jpegQuality));
-            _captured = true;
-            _capturedBytes = bytes;
-            // stop stream to freeze preview
-            if (_streaming) {
-              _controller?.stopImageStream();
-              _streaming = false;
-            }
-            if (mounted) setState(() { _dets = dets; });
-            _processing = false;
-            return;
-          }
+          _captureWithTarget(bestTarget, streamImg: rgb);
+          _processing = false;
+          return;
         }
       }
 
       if (mounted) setState(()=> _dets = dets);
     }
     _processing = false;
+  }
+
+  YoloDetection? _findBestTarget(List<YoloDetection> dets, List<String> labels) {
+    final targetIdx = labels.indexOf(widget.targetLabelName);
+    YoloDetection? best;
+    if (targetIdx >= 0) {
+      for (final d in dets) {
+        if (d.classIndex == targetIdx) {
+          if (best == null || d.score > best.score) best = d;
+        }
+      }
+    } else {
+      for (final d in dets) {
+        final name = (d.classIndex >= 0 && d.classIndex < labels.length) ? labels[d.classIndex] : '';
+        if (name == widget.targetLabelName) {
+          if (best == null || d.score > best.score) best = d;
+        }
+      }
+    }
+    return best;
+  }
+
+  Future<void> _captureWithTarget(YoloDetection bestTarget, {img.Image? streamImg}) async {
+    // Execute capture path using still capture if enabled, fallback to stream crop
+    if (widget.useStillCapture && _controller != null) {
+      try {
+        // Stop stream and capture a high-res still, then crop mapped bbox
+        if (_streaming) {
+          await _controller!.stopImageStream();
+          _streaming = false;
+        }
+        _capturingStill = true;
+        if (mounted) setState(() {});
+
+        final streamW = streamImg?.width ?? _lastStreamImage?.width;
+        final streamH = streamImg?.height ?? _lastStreamImage?.height;
+        if (streamW == null || streamH == null) {
+          // If we have no stream dims, fallback to stream image crop directly if available
+          if (streamImg != null) {
+            final crop = _cropAround(streamImg, bestTarget, padRatio: 0.06);
+            final bytes = Uint8List.fromList(img.encodeJpg(crop, quality: widget.jpegQuality));
+            _completeCapture(bytes);
+          } else {
+            // Can't proceed; resume stream and bail
+            _capturingStill = false;
+            if (mounted) setState(() {});
+            return;
+          }
+        } else {
+          await _captureStillAndCrop(bestTarget, streamW, streamH);
+        }
+      } catch (e) {
+        debugPrint('Still capture failed: $e');
+        // Fallback to stream crop if possible
+        final src = streamImg ?? _lastStreamImage;
+        if (src != null) {
+          final crop = _cropAround(src, bestTarget, padRatio: 0.06);
+          final bytes = Uint8List.fromList(img.encodeJpg(crop, quality: widget.jpegQuality));
+          _completeCapture(bytes);
+        }
+      } finally {
+        _capturingStill = false;
+        if (mounted) setState(() {});
+      }
+    } else {
+      // Crop from stream frame if available
+      final src = streamImg ?? _lastStreamImage;
+      if (src != null) {
+        final crop = _cropAround(src, bestTarget, padRatio: 0.05);
+        final bytes = Uint8List.fromList(img.encodeJpg(crop, quality: widget.jpegQuality));
+        _completeCapture(bytes);
+      }
+    }
+  }
+
+  void _completeCapture(Uint8List bytes) {
+    _captured = true;
+    _capturedBytes = bytes;
+    // pause stream if still running
+    if (_streaming) {
+      _controller?.stopImageStream();
+      _streaming = false;
+    }
+    if (mounted) setState(() {});
   }
 
   Future<void> _captureStillAndCrop(YoloDetection targetOnStream, int streamW, int streamH) async {
@@ -335,6 +388,9 @@ class _LiveCapturePageState extends State<LiveCapturePage> with WidgetsBindingOb
         .toSet();
     final presentCount = required.where(detectedNames.contains).length;
 
+    // Select target for UI display (capture box)
+    final targetForUi = _findBestTarget(_dets, labels);
+
     return Scaffold(
       backgroundColor: Colors.black,
       appBar: AppBar(
@@ -342,9 +398,17 @@ class _LiveCapturePageState extends State<LiveCapturePage> with WidgetsBindingOb
         backgroundColor: Colors.black87,
         foregroundColor: Colors.white,
         actions: [
+          // Toggle boxes visibility
           IconButton(
-            icon: Icon(_streaming ? Icons.pause : Icons.play_arrow),
-            onPressed: () { if (c==null) return; if (_streaming) { c.stopImageStream(); setState(()=>_streaming=false);} else { _start(); setState(()=>_streaming=true);} },
+            tooltip: _showAllBoxes ? 'Hide all boxes' : 'Show all boxes',
+            icon: Icon(_showAllBoxes ? Icons.visibility : Icons.visibility_off),
+            onPressed: () => setState(() => _showAllBoxes = !_showAllBoxes),
+          ),
+          // Toggle auto-capture
+          IconButton(
+            tooltip: _autoCapture ? 'Auto capture: ON' : 'Auto capture: OFF',
+            icon: Icon(_autoCapture ? Icons.flash_auto : Icons.flash_off),
+            onPressed: () => setState(() => _autoCapture = !_autoCapture),
           ),
           IconButton(
             icon: const Icon(Icons.tune),
@@ -352,6 +416,39 @@ class _LiveCapturePageState extends State<LiveCapturePage> with WidgetsBindingOb
           ),
         ],
       ),
+      floatingActionButton: (!_captured && !_capturingStill)
+          ? FloatingActionButton.extended(
+              onPressed: () async {
+                // Manual capture: ensure all required labels present then capture
+                if (c == null || !c.value.isInitialized) return;
+                final labels = widget.model.labels;
+                final required = (widget.requiredLabelNames == null || widget.requiredLabelNames!.isEmpty)
+                    ? labels
+                    : widget.requiredLabelNames!;
+                final dets = _dets;
+                final detectedNames = dets.map((d) => (d.classIndex >= 0 && d.classIndex < labels.length) ? labels[d.classIndex] : 'cls${d.classIndex}')
+                    .toSet();
+                final missing = required.where((r) => !detectedNames.contains(r)).toList();
+                if (missing.isNotEmpty) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Waiting for: ${missing.join(', ')}')),
+                  );
+                  return;
+                }
+                final bestTarget = _findBestTarget(dets, labels);
+                if (bestTarget == null) {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    SnackBar(content: Text('Target not visible: ${widget.targetLabelName}')),
+                  );
+                  return;
+                }
+                await _captureWithTarget(bestTarget, streamImg: _lastStreamImage);
+              },
+              label: const Text('Capture'),
+              icon: const Icon(Icons.camera_alt),
+            )
+          : null,
+      floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
       body: _initializing || c == null || !c.value.isInitialized
           ? const Center(child: CircularProgressIndicator())
           : LayoutBuilder(builder: (ctx, cons) {
@@ -367,17 +464,29 @@ class _LiveCapturePageState extends State<LiveCapturePage> with WidgetsBindingOb
               final scaleY = dispH / rotatedH;
 
               List<Widget> boxes = [];
-              for (final d in _dets) {
-                // d coords already scaled to original frame size post-rotation logic (after rotation correction in conversion)
-                final bw = d.w * scaleX;
-                final bh = d.h * scaleY;
-                final cx = d.cx * scaleX;
-                final cy = d.cy * scaleY;
-                final cls = d.classIndex;
+              if (_showAllBoxes) {
+                for (final d in _dets) {
+                  final bw = d.w * scaleX;
+                  final bh = d.h * scaleY;
+                  final cx = d.cx * scaleX;
+                  final cy = d.cy * scaleY;
+                  final cls = d.classIndex;
+                  _ensureColor(cls);
+                  final color = _colors[cls % _colors.length];
+                  final label = (cls >=0 && cls < widget.model.labels.length) ? widget.model.labels[cls] : 'cls$cls';
+                  boxes.add(Bbox(cx, cy, bw, bh, label, d.score, color));
+                }
+              } else if (_showTargetBox && targetForUi != null) {
+                final t = targetForUi;
+                final bw = t.w * scaleX;
+                final bh = t.h * scaleY;
+                final cx = t.cx * scaleX;
+                final cy = t.cy * scaleY;
+                final cls = t.classIndex;
                 _ensureColor(cls);
-                final color = _colors[cls % _colors.length];
+                final color = Colors.amberAccent; // distinct capture box color
                 final label = (cls >=0 && cls < widget.model.labels.length) ? widget.model.labels[cls] : 'cls$cls';
-                boxes.add(Bbox(cx, cy, bw, bh, label, d.score, color));
+                boxes.add(Bbox(cx, cy, bw, bh, label, t.score, color));
               }
 
               return Center(
@@ -414,6 +523,7 @@ class _LiveCapturePageState extends State<LiveCapturePage> with WidgetsBindingOb
 
                       if (_captured && _capturedBytes != null) ...[
                         Container(color: Colors.black.withValues(alpha: 0.75)),
+                        // ...existing preview overlay (Retake/Use)
                         Align(
                           alignment: Alignment.center,
                           child: Column(
