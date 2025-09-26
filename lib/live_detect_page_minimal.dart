@@ -5,19 +5,17 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image/image.dart' as img;
 import 'bbox.dart';
-import 'yolo_model_helper_minimal.dart';
+import 'yolo_model_helper.dart';
 
-/// Minimal live detection page using YoloModelMinimal.
-/// NOTE: This is intentionally simplified: no rotation fallback, no auto-capture,
-/// no frame skipping logic beyond a basic throttle, and a naive YUV420 -> RGB conversion.
-class LiveDetectPageMinimal extends StatefulWidget {
-  final YoloModelMinimal model;
-  const LiveDetectPageMinimal({super.key, required this.model});
+///live detection page using YoloModelMinimal.
+class LiveDetectPage extends StatefulWidget {
+  final YoloModelHelper model;
+  const LiveDetectPage({super.key, required this.model});
   @override
-  State<LiveDetectPageMinimal> createState() => _LiveDetectPageMinimalState();
+  State<LiveDetectPage> createState() => _LiveDetectPageState();
 }
 
-class _LiveDetectPageMinimalState extends State<LiveDetectPageMinimal> with WidgetsBindingObserver {
+class _LiveDetectPageState extends State<LiveDetectPage> with WidgetsBindingObserver {
   CameraController? _controller;
   bool _initializing = true;
   bool _processing = false;
